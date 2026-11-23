@@ -1,5 +1,6 @@
 #include "afec_node.h"
 #include <string.h>
+#include <Arduino.h>
 
 namespace afec {
 
@@ -45,6 +46,11 @@ uint8_t Node::rssiQ(int16_t r) const {
 }
 
 uint8_t Node::feedback(uint8_t score, int16_t rssi) const {
+    if (printDebug != NULL) {
+        printDebug("Score: ");
+        printDebug(String(score).c_str());
+        printDebug("\n");
+    }
     if (_cfg.mode == Mode::AFEC) return score;
     if (_cfg.mode == Mode::RSSI) return rssiQ(rssi);
     return 0;
@@ -54,11 +60,11 @@ uint8_t Node::feedback(uint8_t score, int16_t rssi) const {
 void Node::stepLevel(uint8_t& level, uint8_t& streak, uint8_t fb) {
     if (_cfg.mode == Mode::AFEC) {
         switch (Lhs::decide(fb)) {
-            case Action::DOWNGRADE:    if (++streak >= _cfg.downgradeAfter) { if (level > 0) level--; streak = 0; } return;
-            case Action::HOLD:         streak = 0; return;
-            case Action::UPGRADE:      streak = 0; if (level < MAX_LEVEL) level++; return;
-            case Action::NACK_UPGRADE: streak = 0; nackJump(level); return;
-            case Action::MAX_PROTECT:  streak = 0; level = MAX_LEVEL; return;
+            case Action::DOWNGRADE:    if (++streak >= _cfg.downgradeAfter) { if (level > 0) level--; streak = 0; if (printDebug != NULL) {printDebug("Level DOWNGRADE\n");;printDebug("Streak: ");printDebug(String(streak).c_str());printDebug("\n");printDebug("Level: ");printDebug(String(level).c_str());printDebug("\n");} } return;
+            case Action::HOLD:         streak = 0; if (printDebug != NULL) {printDebug("Level HOLD\n");printDebug("Streak: ");printDebug(String(streak).c_str());printDebug("\n");printDebug("Level: ");printDebug(String(level).c_str());printDebug("\n");} return;
+            case Action::UPGRADE:      streak = 0; if (printDebug != NULL) {printDebug("Level UPGRADE\n");printDebug("Streak: ");printDebug(String(streak).c_str());printDebug("\n");printDebug("Level: ");printDebug(String(level).c_str());printDebug("\n");} if (level < MAX_LEVEL) level++; return;
+            case Action::NACK_UPGRADE: streak = 0; if (printDebug != NULL) {printDebug("Level NACK UPGRADE\n");printDebug("Streak: ");printDebug(String(streak).c_str());printDebug("\n");printDebug("Level: ");printDebug(String(level).c_str());printDebug("\n");} nackJump(level); return;
+            case Action::MAX_PROTECT:  streak = 0; if (printDebug != NULL) {printDebug("Level MAX_PROTECT\n");printDebug("Streak: ");printDebug(String(streak).c_str());printDebug("\n");printDebug("Level: ");printDebug(String(level).c_str());printDebug("\n");} level = MAX_LEVEL; return;
         }
     } else if (_cfg.mode == Mode::RSSI) {
         const RssiPolicy& p = _cfg.rssi;
@@ -104,6 +110,7 @@ Result Node::transmit(const Frame& fin, uint8_t level) {
     refillDuty();
     uint32_t at = airtimeUs(n);
     if (_budgetUs < (int64_t)at) { _st.dutyBlocked++; return Result::DUTY_LIMIT; }
+    if (printDebug != NULL) printDebug("Transmitting...\n");
     if (!_r->send(buf, n)) return Result::RADIO_ERR;
     _budgetUs -= at; _st.txFrames++;
     return Result::OK;
@@ -126,11 +133,13 @@ Result Node::send(uint8_t dst, const uint8_t* payload, uint8_t len, bool reliabl
         if (a) _st.txRetries++;
 
         if (reliable) { _wait = Wait(); _wait.active = true; _wait.dst = dst; _wait.seq = f.seq; }
+        if (printDebug != NULL) {printDebug("================================================================\n");printDebug("Sending something...\n");}
         Result r = transmit(f, levelFor(pr));
         if (r != Result::OK) { _wait.active = false; return r; }
         if (!reliable) return Result::OK;
 
         uint32_t t0 = _p.millis();
+        if (printDebug != NULL) printDebug("Waiting for ACK\n");
         while (!_wait.ack && !_wait.nack && (uint32_t)(_p.millis() - t0) < _cfg.ackTimeoutMs) {
             processRx();
             if (_p.yield) _p.yield();
@@ -142,6 +151,7 @@ Result Node::send(uint8_t dst, const uint8_t* payload, uint8_t len, bool reliabl
         _st.timeouts++;
         if (adaptive()) { after.streak = 0; after.level = MAX_LEVEL; }                              // "0x0": max protection
     }
+    if (printDebug != NULL) printDebug("No ACK\n");
     return Result::NO_ACK;
 }
 
@@ -180,10 +190,12 @@ void Node::handleAir(const uint8_t* buf, uint8_t n, const CC1101::RxInfo& ri) {
     bool forMe = (f.dst == _cfg.id), bcast = (f.dst == BROADCAST);
 
     if (f.type == MsgType::ACK && forMe) {
+        if (printDebug != NULL) printDebug("ACK for me\n");
         if (_wait.active && f.plen >= 1 && f.payload[0] == _wait.seq && f.src == _wait.dst) { _wait.ack = true; _wait.fb = f.lhs; _st.acksRx++; }
         return;
     }
     if (f.type == MsgType::DATA && (forMe || bcast)) {
+        if (printDebug != NULL) printDebug("Payload for me\n");
         if (forMe && (f.flags & FLAG_ACK_REQ)) sendAck(f, fb);                // re-ACK duplicates too
         if (dup) _st.rxDup++; else if (_cb) _cb(_cbCtx, f.src, f.payload, f.plen, fb);
         if (!forMe && !dup) queueRelay(f, fb);
@@ -207,6 +219,7 @@ void Node::sendNack(uint8_t fb) {
     Frame a;
     a.src = _cfg.id; a.dst = BROADCAST; a.seq = _seq++; a.ttl = 0;
     a.type = MsgType::NACK; a.lhs = fb; a.plen = 0;
+    if (printDebug != NULL) printDebug("Sending NACK\n");
     if (transmit(a, MAX_LEVEL) == Result::OK) _st.nacksTx++;
 }
 
@@ -225,6 +238,7 @@ void Node::pumpRelay() {
     for (auto& s : _rq) {
         if (!s.used || (int32_t)(_p.millis() - s.due) < 0) continue;
         Peer tmp; tmp.level = _hopLevel;
+        if (printDebug != NULL) printDebug("Relaying...\n");
         if (transmit(s.f, levelFor(tmp)) == Result::OK) _st.relayed++; else _st.relayDropped++;
         s.used = false;
     }

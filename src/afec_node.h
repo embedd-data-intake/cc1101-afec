@@ -77,6 +77,7 @@ public:
     void    resetLink(uint8_t id);                 // back to initialLevel (start of a block)
     const Stats& stats() const { return _st; }
 
+    void (*printDebug)(const char *);
 private:
     struct Peer  { uint8_t id = 0; bool used = false; uint8_t level = 0, rxFb = 0xA, streak = 0; uint32_t lastUse = 0; };
     struct Wait  { bool active = false; uint8_t dst = 0, seq = 0; bool ack = false, nack = false; uint8_t fb = 0; };
