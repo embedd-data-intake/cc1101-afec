@@ -1,8 +1,62 @@
 #include "afec_node.h"
 #include <string.h>
-#include <Arduino.h>
+
+// ------------------------------------------------------------------ logging
+// printDebug is printf-style: void (*printDebug)(const char*, ...)
+// Compile-time verbosity: 0=off 1=ERR 2=WARN 3=INFO 4=DBG  (override with -DAFEC_LOG_LEVEL=n)
+// Every line: "[millis] N<nodeId> <L> message". Only valid inside Node members.
+#ifndef AFEC_LOG_LEVEL
+#define AFEC_LOG_LEVEL 4
+#endif
+
+#define AFEC_LOG(lvl, tag, fmt, ...)                                                      \
+    do {                                                                                  \
+        if ((lvl) <= AFEC_LOG_LEVEL && printDebug)                                        \
+            printDebug("[%lu] N%u " tag " " fmt "\n", (unsigned long)_p.millis(),         \
+                       (unsigned)_cfg.id, ##__VA_ARGS__);                                 \
+    } while (0)
+
+#define LOGE(fmt, ...) AFEC_LOG(1, "E", fmt, ##__VA_ARGS__)
+#define LOGW(fmt, ...) AFEC_LOG(2, "W", fmt, ##__VA_ARGS__)
+#define LOGI(fmt, ...) AFEC_LOG(3, "I", fmt, ##__VA_ARGS__)
+#define LOGD(fmt, ...) AFEC_LOG(4, "D", fmt, ##__VA_ARGS__)
 
 namespace afec {
+
+namespace {
+
+[[maybe_unused]] const char* resultStr(Result r) {
+    switch (r) {
+        case Result::OK:         return "OK";
+        case Result::TOO_LONG:   return "TOO_LONG";
+        case Result::DUTY_LIMIT: return "DUTY_LIMIT";
+        case Result::RADIO_ERR:  return "RADIO_ERR";
+        case Result::NO_ACK:     return "NO_ACK";
+        default:                 return "?";
+    }
+}
+
+[[maybe_unused]] const char* typeStr(MsgType t) {
+    switch (t) {
+        case MsgType::DATA: return "DATA";
+        case MsgType::ACK:  return "ACK";
+        case MsgType::NACK: return "NACK";
+        default:            return "?";
+    }
+}
+
+[[maybe_unused]] const char* actionStr(Action a) {
+    switch (a) {
+        case Action::DOWNGRADE:    return "DOWNGRADE";
+        case Action::HOLD:         return "HOLD";
+        case Action::UPGRADE:      return "UPGRADE";
+        case Action::NACK_UPGRADE: return "NACK_UPGRADE";
+        case Action::MAX_PROTECT:  return "MAX_PROTECT";
+        default:                   return "?";
+    }
+}
+
+} // namespace
 
 bool Node::begin(CC1101& radio, const NodeConfig& cfg, const Platform& plat) {
     if (!plat.millis || !plat.random) return false;
@@ -13,6 +67,7 @@ bool Node::begin(CC1101& radio, const NodeConfig& cfg, const Platform& plat) {
     _hopLevel = _cfg.initialLevel;
     _budgetUs = (int64_t)_cfg.dutyBurstMs * 1000;
     _lastRefill = _p.millis();
+    LOGI("BEGIN mode=%u initLvl=%u bitrate=%lu duty=%u%% burst=%ums retries=%u ackTo=%ums", (unsigned)_cfg.mode, _cfg.initialLevel, (unsigned long)_cfg.bitrateBps, (unsigned)_cfg.dutyPercent, (unsigned)_cfg.dutyBurstMs, _cfg.maxRetries, (unsigned)_cfg.ackTimeoutMs);
     return true;
 }
 
@@ -24,14 +79,17 @@ Node::Peer& Node::peer(uint8_t id) {
         if (!p.used) victim = &p;
         else if (victim->used && p.lastUse < victim->lastUse) victim = &p;
     }
+    if (victim->used) LOGD("PEER evict id=%u", victim->id);
     *victim = Peer(); victim->used = true; victim->id = id;
     victim->level = _cfg.initialLevel; victim->lastUse = ++_tick;
+    LOGD("PEER new id=%u lvl=%u", id, victim->level);
     return *victim;
 }
 
 void Node::resetLink(uint8_t id) {
     Peer& p = peer(id); p.level = _cfg.initialLevel; p.streak = 0; p.rxFb = 0xA;
     _hopLevel = _cfg.initialLevel; _hopStreak = 0;
+    LOGI("LINK reset peer=%u lvl=%u", id, p.level);
 }
 
 uint8_t Node::peerLevel(uint8_t id) { return levelFor(peer(id)); }
@@ -45,32 +103,42 @@ uint8_t Node::rssiQ(int16_t r) const {
     return (uint8_t)(((int32_t)(r - p.minDbm) * 15) / (p.maxDbm - p.minDbm));
 }
 
+// Pure mapping, no logging here: callers log with full context (src/seq/rssi/lqi).
 uint8_t Node::feedback(uint8_t score, int16_t rssi) const {
-    if (printDebug != NULL) {
-        printDebug("Score: ");
-        printDebug(String(score).c_str());
-        printDebug("\n");
-    }
     if (_cfg.mode == Mode::AFEC) return score;
     if (_cfg.mode == Mode::RSSI) return rssiQ(rssi);
     return 0;
 }
 
 // One level step per ACK. C5: Table 1. C4: threshold + hysteresis on the same 4 bits.
+// Logs one line per step: INFO if the level moved, DBG otherwise.
 void Node::stepLevel(uint8_t& level, uint8_t& streak, uint8_t fb) {
+    const uint8_t prevLevel = level, prevStreak = streak;
+    const char* act = "-";
+
     if (_cfg.mode == Mode::AFEC) {
-        switch (Lhs::decide(fb)) {
-            case Action::DOWNGRADE:    if (++streak >= _cfg.downgradeAfter) { if (level > 0) level--; streak = 0; if (printDebug != NULL) {printDebug("Level DOWNGRADE\n");;printDebug("Streak: ");printDebug(String(streak).c_str());printDebug("\n");printDebug("Level: ");printDebug(String(level).c_str());printDebug("\n");} } return;
-            case Action::HOLD:         streak = 0; if (printDebug != NULL) {printDebug("Level HOLD\n");printDebug("Streak: ");printDebug(String(streak).c_str());printDebug("\n");printDebug("Level: ");printDebug(String(level).c_str());printDebug("\n");} return;
-            case Action::UPGRADE:      streak = 0; if (printDebug != NULL) {printDebug("Level UPGRADE\n");printDebug("Streak: ");printDebug(String(streak).c_str());printDebug("\n");printDebug("Level: ");printDebug(String(level).c_str());printDebug("\n");} if (level < MAX_LEVEL) level++; return;
-            case Action::NACK_UPGRADE: streak = 0; if (printDebug != NULL) {printDebug("Level NACK UPGRADE\n");printDebug("Streak: ");printDebug(String(streak).c_str());printDebug("\n");printDebug("Level: ");printDebug(String(level).c_str());printDebug("\n");} nackJump(level); return;
-            case Action::MAX_PROTECT:  streak = 0; if (printDebug != NULL) {printDebug("Level MAX_PROTECT\n");printDebug("Streak: ");printDebug(String(streak).c_str());printDebug("\n");printDebug("Level: ");printDebug(String(level).c_str());printDebug("\n");} level = MAX_LEVEL; return;
+        const Action a = Lhs::decide(fb);
+        act = actionStr(a);
+        switch (a) {
+            case Action::DOWNGRADE:
+                if (++streak >= _cfg.downgradeAfter) { if (level > 0) level--; streak = 0; }
+                break;
+            case Action::HOLD:         streak = 0; break;
+            case Action::UPGRADE:      streak = 0; if (level < MAX_LEVEL) level++; break;
+            case Action::NACK_UPGRADE: streak = 0; nackJump(level); break;
+            case Action::MAX_PROTECT:  streak = 0; level = MAX_LEVEL; break;
         }
     } else if (_cfg.mode == Mode::RSSI) {
         const RssiPolicy& p = _cfg.rssi;
-        if (level < MAX_LEVEL && fb < p.up[level]) level++;
-        else if (level > 0 && fb >= p.up[level - 1] + p.hys) level--;
+        if (level < MAX_LEVEL && fb < p.up[level]) { level++; act = "RSSI_UP"; }
+        else if (level > 0 && fb >= p.up[level - 1] + p.hys) { level--; act = "RSSI_DOWN"; }
+        else act = "RSSI_HOLD";
     }
+
+    if (level != prevLevel)
+        LOGI("LVL %s fb=0x%X lvl %u->%u streak %u->%u/%u", act, fb, prevLevel, level, prevStreak, streak, _cfg.downgradeAfter);
+    else
+        LOGD("LVL %s fb=0x%X lvl=%u streak %u->%u/%u", act, fb, level, prevStreak, streak, _cfg.downgradeAfter);
 }
 
 void Node::nackJump(uint8_t& level) {
@@ -104,21 +172,37 @@ Result Node::transmit(const Frame& fin, uint8_t level) {
         memset(f.payload + f.plen, 0, _cfg.fixedPayloadLen - f.plen); f.plen = _cfg.fixedPayloadLen;
     }
     uint8_t buf[AIR_MAX], n = 0;
+    const uint8_t reqLevel = level;
     level = fitLevel(level, f.plen);
-    if (!encodeFrame(f, level, buf, &n)) return Result::TOO_LONG;
+    if (level != reqLevel)
+        LOGD("TX level clamp %u->%u (plen=%u)", reqLevel, level, f.plen);
+    if (!encodeFrame(f, level, buf, &n)) {
+        LOGW("TX %s %u>%u seq=%u TOO_LONG plen=%u lvl=%u", typeStr(f.type), f.src, f.dst, f.seq, f.plen, level);
+        return Result::TOO_LONG;
+    }
 
     refillDuty();
     uint32_t at = airtimeUs(n);
-    if (_budgetUs < (int64_t)at) { _st.dutyBlocked++; return Result::DUTY_LIMIT; }
-    if (printDebug != NULL) printDebug("Transmitting...\n");
-    if (!_r->send(buf, n)) return Result::RADIO_ERR;
+    if (_budgetUs < (int64_t)at) {
+        _st.dutyBlocked++;
+        LOGW("TX %s %u>%u seq=%u DUTY_LIMIT need=%luus have=%ldus blocked=%lu", typeStr(f.type), f.src, f.dst, f.seq, (unsigned long)at, (long)_budgetUs, (unsigned long)_st.dutyBlocked);
+        return Result::DUTY_LIMIT;
+    }
+    if (!_r->send(buf, n)) {
+        LOGE("TX %s %u>%u seq=%u RADIO_ERR", typeStr(f.type), f.src, f.dst, f.seq);
+        return Result::RADIO_ERR;
+    }
     _budgetUs -= at; _st.txFrames++;
+    LOGD("TX %s %u>%u seq=%u ttl=%u flags=0x%02X lhs=0x%X lvl=%u plen=%u air=%uB/%luus budget=%ldus", typeStr(f.type), f.src, f.dst, f.seq, f.ttl, f.flags, f.lhs, level, f.plen, n, (unsigned long)at, (long)_budgetUs);
     return Result::OK;
 }
 
 Result Node::send(uint8_t dst, const uint8_t* payload, uint8_t len, bool reliable) {
     if (dst == BROADCAST || _cfg.mode == Mode::RAW) reliable = false;
-    if (len > maxPayload(adaptive() ? 0 : LEVEL_NONE) || (len && !payload)) return Result::TOO_LONG;
+    if (len > maxPayload(adaptive() ? 0 : LEVEL_NONE) || (len && !payload)) {
+        LOGW("SEND dst=%u len=%u rejected: TOO_LONG/null payload", dst, len);
+        return Result::TOO_LONG;
+    }
 
     Frame f;
     f.src = _cfg.id; f.dst = dst; f.seq = _seq++; f.ttl = _cfg.defaultTtl;
@@ -127,31 +211,54 @@ Result Node::send(uint8_t dst, const uint8_t* payload, uint8_t len, bool reliabl
     seenOrAdd(f.src, f.seq);
 
     const uint8_t tries = reliable ? 1 + _cfg.maxRetries : 1;
+    LOGI("SEND dst=%u seq=%u len=%u reliable=%u tries=%u", dst, f.seq, len, reliable, tries);
+
     for (uint8_t a = 0; a < tries; a++) {
         Peer& pr = peer(dst);
         f.lhs = pr.rxFb & 0x0F;
-        if (a) _st.txRetries++;
+        if (a) { _st.txRetries++; LOGI("SEND seq=%u retry %u/%u", f.seq, a, tries - 1); }
 
         if (reliable) { _wait = Wait(); _wait.active = true; _wait.dst = dst; _wait.seq = f.seq; }
-        if (printDebug != NULL) {printDebug("================================================================\n");printDebug("Sending something...\n");}
-        Result r = transmit(f, levelFor(pr));
-        if (r != Result::OK) { _wait.active = false; return r; }
+        const uint8_t lvl = levelFor(pr);
+        LOGD("SEND seq=%u attempt %u/%u peerLvl=%u streak=%u lhs=0x%X", f.seq, a + 1, tries, lvl, pr.streak, f.lhs);
+        Result r = transmit(f, lvl);
+        if (r != Result::OK) {
+            _wait.active = false;
+            LOGW("SEND seq=%u aborted: %s", f.seq, resultStr(r));
+            return r;
+        }
         if (!reliable) return Result::OK;
 
         uint32_t t0 = _p.millis();
-        if (printDebug != NULL) printDebug("Waiting for ACK\n");
         while (!_wait.ack && !_wait.nack && (uint32_t)(_p.millis() - t0) < _cfg.ackTimeoutMs) {
             processRx();
             if (_p.yield) _p.yield();
         }
         _wait.active = false;
+        const uint32_t waited = (uint32_t)(_p.millis() - t0);
         Peer& after = peer(dst);
-        if (_wait.ack)  { if (adaptive()) stepLevel(after.level, after.streak, _wait.fb); return Result::OK; }
-        if (_wait.nack) { if (adaptive()) { after.streak = 0; nackJump(after.level); } continue; }   // retransmit at once
+        if (_wait.ack) {
+            LOGI("SEND seq=%u ACK from %u rtt=%lums fb=0x%X attempts=%u", f.seq, dst, (unsigned long)waited, _wait.fb, a + 1);
+            if (adaptive()) stepLevel(after.level, after.streak, _wait.fb);
+            return Result::OK;
+        }
+        if (_wait.nack) {
+            LOGW("SEND seq=%u NACK after %lums fb=0x%X -> retransmit", f.seq, (unsigned long)waited, _wait.fb);
+            if (adaptive()) {
+                const uint8_t before = after.level;
+                after.streak = 0; nackJump(after.level);
+                LOGI("LVL NACK_JUMP peer=%u lvl %u->%u", dst, before, after.level);
+            }
+            continue;                                                                    // retransmit at once
+        }
         _st.timeouts++;
-        if (adaptive()) { after.streak = 0; after.level = MAX_LEVEL; }                              // "0x0": max protection
+        LOGW("SEND seq=%u TIMEOUT after %lums (timeouts=%lu)", f.seq, (unsigned long)waited, (unsigned long)_st.timeouts);
+        if (adaptive()) {                                                                // "0x0": max protection
+            LOGI("LVL TIMEOUT peer=%u lvl %u->%u", dst, after.level, (unsigned)MAX_LEVEL);
+            after.streak = 0; after.level = MAX_LEVEL;
+        }
     }
-    if (printDebug != NULL) printDebug("No ACK\n");
+    LOGE("SEND seq=%u dst=%u NO_ACK after %u tries", f.seq, dst, tries);
     return Result::NO_ACK;
 }
 
@@ -172,30 +279,56 @@ void Node::handleAir(const uint8_t* buf, uint8_t n, const CC1101::RxInfo& ri) {
     switch (decodeFrame(buf, n, f, di)) {
         case DecodeStatus::OK: break;
         case DecodeStatus::TOO_SHORT:
-        case DecodeStatus::BAD_HEADER: _st.rxBadHeader++; return;            // silent: sender times out
-        case DecodeStatus::ECC_FAIL:   _st.rxEccFail++; if (adaptive()) sendNack(feedback(_lhs.score(0, di.t, ri.rssiDbm, ri.lqi, true), ri.rssiDbm)); return;
-        case DecodeStatus::CRC_FAIL:   _st.rxCrcFail++; if (adaptive()) sendNack(feedback(_lhs.score(0, di.t, ri.rssiDbm, ri.lqi, true), ri.rssiDbm)); return;
+        case DecodeStatus::BAD_HEADER:                                       // silent: sender times out
+            _st.rxBadHeader++;
+            LOGW("RX bad header len=%u rssi=%d lqi=%u (total=%lu)", n, ri.rssiDbm, (unsigned)ri.lqi, (unsigned long)_st.rxBadHeader);
+            return;
+        case DecodeStatus::ECC_FAIL: {
+            _st.rxEccFail++;
+            uint8_t fb = feedback(_lhs.score(0, di.t, ri.rssiDbm, ri.lqi, true), ri.rssiDbm);
+            LOGW("RX ECC_FAIL len=%u t=%u rssi=%d lqi=%u fb=0x%X (total=%lu)", n, (unsigned)di.t, ri.rssiDbm, (unsigned)ri.lqi, fb, (unsigned long)_st.rxEccFail);
+            if (adaptive()) sendNack(fb);
+            return;
+        }
+        case DecodeStatus::CRC_FAIL: {
+            _st.rxCrcFail++;
+            uint8_t fb = feedback(_lhs.score(0, di.t, ri.rssiDbm, ri.lqi, true), ri.rssiDbm);
+            LOGW("RX CRC_FAIL len=%u t=%u rssi=%d lqi=%u fb=0x%X (total=%lu)", n, (unsigned)di.t, ri.rssiDbm, (unsigned)ri.lqi, fb, (unsigned long)_st.rxCrcFail);
+            if (adaptive()) sendNack(fb);
+            return;
+        }
     }
     _st.rxOk++; _st.eccCorrected += di.corrected;
     uint8_t fb = feedback(_lhs.score(di.corrected, di.t, ri.rssiDbm, ri.lqi, false), ri.rssiDbm);
+    LOGD("RX %s %u>%u seq=%u ttl=%u plen=%u corr=%u t=%u rssi=%d lqi=%u fb=0x%X", typeStr(f.type), f.src, f.dst, f.seq, f.ttl, f.plen, (unsigned)di.corrected, (unsigned)di.t, ri.rssiDbm, (unsigned)ri.lqi, fb);
 
     if (f.type == MsgType::NACK) {                                            // link-local, never relayed
-        if (_wait.active) { _wait.nack = true; _wait.fb = f.lhs; _st.nacksRx++; }
+        if (_wait.active) {
+            _wait.nack = true; _wait.fb = f.lhs; _st.nacksRx++;
+            LOGD("RX NACK from %u consumed by pending send seq=%u", f.src, _wait.seq);
+        } else {
+            LOGD("RX NACK from %u ignored (no pending send)", f.src);
+        }
         return;
     }
-    if (f.src == _cfg.id) return;
+    if (f.src == _cfg.id) { LOGD("RX own frame seq=%u ignored", f.seq); return; }
     peer(f.src).rxFb = fb;
     if (adaptive()) stepLevel(_hopLevel, _hopStreak, fb);
     bool dup = seenOrAdd(f.src, f.seq);
     bool forMe = (f.dst == _cfg.id), bcast = (f.dst == BROADCAST);
+    if (dup) LOGD("RX dup %u seq=%u", f.src, f.seq);
 
     if (f.type == MsgType::ACK && forMe) {
-        if (printDebug != NULL) printDebug("ACK for me\n");
-        if (_wait.active && f.plen >= 1 && f.payload[0] == _wait.seq && f.src == _wait.dst) { _wait.ack = true; _wait.fb = f.lhs; _st.acksRx++; }
+        if (_wait.active && f.plen >= 1 && f.payload[0] == _wait.seq && f.src == _wait.dst) {
+            _wait.ack = true; _wait.fb = f.lhs; _st.acksRx++;
+            LOGD("RX ACK from %u for seq=%u fb=0x%X", f.src, f.payload[0], f.lhs);
+        } else {
+            LOGD("RX ACK from %u stale/unexpected (ackSeq=%u waitActive=%u waitSeq=%u)", f.src, f.plen ? f.payload[0] : 0, _wait.active, _wait.seq);
+        }
         return;
     }
     if (f.type == MsgType::DATA && (forMe || bcast)) {
-        if (printDebug != NULL) printDebug("Payload for me\n");
+        LOGI("RX DATA from %u seq=%u plen=%u %s%s fb=0x%X", f.src, f.seq, f.plen, bcast ? "bcast" : "unicast", dup ? " (dup)" : "", fb);
         if (forMe && (f.flags & FLAG_ACK_REQ)) sendAck(f, fb);                // re-ACK duplicates too
         if (dup) _st.rxDup++; else if (_cb) _cb(_cbCtx, f.src, f.payload, f.plen, fb);
         if (!forMe && !dup) queueRelay(f, fb);
@@ -209,37 +342,53 @@ void Node::sendAck(const Frame& rx, uint8_t fb) {
     a.src = _cfg.id; a.dst = rx.src; a.seq = _seq++; a.ttl = _cfg.defaultTtl;
     a.type = MsgType::ACK; a.lhs = fb; a.plen = 1; a.payload[0] = rx.seq;
     seenOrAdd(a.src, a.seq);
-    if (transmit(a, levelFor(peer(rx.src))) == Result::OK) _st.acksTx++;
+    Result r = transmit(a, levelFor(peer(rx.src)));
+    if (r == Result::OK) { _st.acksTx++; LOGD("ACK sent to %u for seq=%u fb=0x%X", rx.src, rx.seq, fb); }
+    else                 { LOGW("ACK to %u for seq=%u failed: %s", rx.src, rx.seq, resultStr(r)); }
 }
 
 void Node::sendNack(uint8_t fb) {
     uint32_t now = _p.millis();
-    if (_nackEver && (uint32_t)(now - _lastNack) < _cfg.nackHoldoffMs) return;
+    if (_nackEver && (uint32_t)(now - _lastNack) < _cfg.nackHoldoffMs) {
+        LOGD("NACK suppressed (holdoff %lums left)", (unsigned long)(_cfg.nackHoldoffMs - (uint32_t)(now - _lastNack)));
+        return;
+    }
     _lastNack = now; _nackEver = true;
     Frame a;
     a.src = _cfg.id; a.dst = BROADCAST; a.seq = _seq++; a.ttl = 0;
     a.type = MsgType::NACK; a.lhs = fb; a.plen = 0;
-    if (printDebug != NULL) printDebug("Sending NACK\n");
-    if (transmit(a, MAX_LEVEL) == Result::OK) _st.nacksTx++;
+    Result r = transmit(a, MAX_LEVEL);
+    if (r == Result::OK) { _st.nacksTx++; LOGI("NACK sent fb=0x%X (total=%lu)", fb, (unsigned long)_st.nacksTx); }
+    else                 { LOGW("NACK send failed: %s", resultStr(r)); }
 }
 
 // ------------------------------------------------------------------ relay (store & forward)
 void Node::queueRelay(Frame f, uint8_t fb) {
-    if (f.ttl == 0) return;
+    if (f.ttl == 0) { LOGD("RELAY skip %u>%u seq=%u: ttl=0", f.src, f.dst, f.seq); return; }
     for (auto& s : _rq) if (!s.used) {
         f.ttl--; f.lhs = fb & 0x0F; s.f = f; s.used = true;
-        s.due = _p.millis() + _cfg.relayJitterMinMs + _p.random((uint32_t)(_cfg.relayJitterMaxMs - _cfg.relayJitterMinMs + 1));
+        const uint32_t jitter = _p.random((uint32_t)(_cfg.relayJitterMaxMs - _cfg.relayJitterMinMs + 1));
+        const uint32_t delay  = _cfg.relayJitterMinMs + jitter;
+        s.due = _p.millis() + delay;
+        LOGD("RELAY queued %s %u>%u seq=%u ttl=%u in %lums", typeStr(f.type), f.src, f.dst, f.seq, f.ttl, (unsigned long)delay);
         return;
     }
     _st.relayDropped++;
+    LOGW("RELAY queue full: dropped %u>%u seq=%u (total=%lu)", f.src, f.dst, f.seq, (unsigned long)_st.relayDropped);
 }
 
 void Node::pumpRelay() {
     for (auto& s : _rq) {
         if (!s.used || (int32_t)(_p.millis() - s.due) < 0) continue;
         Peer tmp; tmp.level = _hopLevel;
-        if (printDebug != NULL) printDebug("Relaying...\n");
-        if (transmit(s.f, levelFor(tmp)) == Result::OK) _st.relayed++; else _st.relayDropped++;
+        Result r = transmit(s.f, levelFor(tmp));
+        if (r == Result::OK) {
+            _st.relayed++;
+            LOGI("RELAY fwd %s %u>%u seq=%u ttl=%u lvl=%u", typeStr(s.f.type), s.f.src, s.f.dst, s.f.seq, s.f.ttl, levelFor(tmp));
+        } else {
+            _st.relayDropped++;
+            LOGW("RELAY drop %u>%u seq=%u: %s", s.f.src, s.f.dst, s.f.seq, resultStr(r));
+        }
         s.used = false;
     }
 }
