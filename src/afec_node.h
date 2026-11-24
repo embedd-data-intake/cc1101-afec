@@ -77,9 +77,12 @@ public:
     void    resetLink(uint8_t id);                 // back to initialLevel (start of a block)
     const Stats& stats() const { return _st; }
 
-    void (*printDebug)(const char *, ...);
+    void (*printDebug)(const char *, ...) = nullptr;   // was uninitialised: garbage pointer on a non-static Node
 private:
-    struct Peer  { uint8_t id = 0; bool used = false; uint8_t level = 0, rxFb = 0xA, streak = 0; uint32_t lastUse = 0; };
+    // level/streak  : TX level for DATA towards this peer, driven by the feedback in the peer's ACKs
+    // ackLevel/ackStreak : TX level for ACK/NACK replies to this peer, driven by the quality of the
+    //                      frames we RECEIVE from it (receiver-side adaptation)
+    struct Peer  { uint8_t id = 0; bool used = false; uint8_t level = 0, rxFb = 0xA, streak = 0; uint8_t ackLevel = 0, ackStreak = 0; uint32_t lastUse = 0; };
     struct Wait  { bool active = false; uint8_t dst = 0, seq = 0; bool ack = false, nack = false; uint8_t fb = 0; };
     struct Relay { bool used = false; uint32_t due = 0; Frame f; };
     struct Seen {
@@ -96,7 +99,7 @@ private:
     uint8_t levelFor(const Peer& p) const;
     uint8_t rssiQ(int16_t rssi) const;
     uint8_t feedback(uint8_t score, int16_t rssi) const;
-    void    stepLevel(uint8_t& level, uint8_t& streak, uint8_t fb);
+    void    stepLevel(uint8_t& level, uint8_t& streak, uint8_t fb, const char* tag, uint8_t id);
     void    nackJump(uint8_t& level);
     Peer&   peer(uint8_t id);
     bool    seenOrAdd(uint8_t src, uint8_t seq);

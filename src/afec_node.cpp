@@ -81,13 +81,14 @@ Node::Peer& Node::peer(uint8_t id) {
     }
     if (victim->used) LOGD("PEER evict id=%u", victim->id);
     *victim = Peer(); victim->used = true; victim->id = id;
-    victim->level = _cfg.initialLevel; victim->lastUse = ++_tick;
+    victim->level = _cfg.initialLevel; victim->ackLevel = _cfg.initialLevel; victim->lastUse = ++_tick;
     LOGD("PEER new id=%u lvl=%u", id, victim->level);
     return *victim;
 }
 
 void Node::resetLink(uint8_t id) {
     Peer& p = peer(id); p.level = _cfg.initialLevel; p.streak = 0; p.rxFb = 0xA;
+    p.ackLevel = _cfg.initialLevel; p.ackStreak = 0;
     _hopLevel = _cfg.initialLevel; _hopStreak = 0;
     LOGI("LINK reset peer=%u lvl=%u", id, p.level);
 }
@@ -112,7 +113,7 @@ uint8_t Node::feedback(uint8_t score, int16_t rssi) const {
 
 // One level step per ACK. C5: Table 1. C4: threshold + hysteresis on the same 4 bits.
 // Logs one line per step: INFO if the level moved, DBG otherwise.
-void Node::stepLevel(uint8_t& level, uint8_t& streak, uint8_t fb) {
+void Node::stepLevel(uint8_t& level, uint8_t& streak, uint8_t fb, const char* tag, uint8_t id) {
     const uint8_t prevLevel = level, prevStreak = streak;
     const char* act = "-";
 
@@ -136,9 +137,9 @@ void Node::stepLevel(uint8_t& level, uint8_t& streak, uint8_t fb) {
     }
 
     if (level != prevLevel)
-        LOGI("LVL %s fb=0x%X lvl %u->%u streak %u->%u/%u", act, fb, prevLevel, level, prevStreak, streak, _cfg.downgradeAfter);
+        LOGI("LVL %s[%u] %s fb=0x%X lvl %u->%u streak %u->%u/%u", tag, id, act, fb, prevLevel, level, prevStreak, streak, _cfg.downgradeAfter);
     else
-        LOGD("LVL %s fb=0x%X lvl=%u streak %u->%u/%u", act, fb, level, prevStreak, streak, _cfg.downgradeAfter);
+        LOGD("LVL %s[%u] %s fb=0x%X lvl=%u streak %u->%u/%u", tag, id, act, fb, level, prevStreak, streak, _cfg.downgradeAfter);
 }
 
 void Node::nackJump(uint8_t& level) {
@@ -239,7 +240,7 @@ Result Node::send(uint8_t dst, const uint8_t* payload, uint8_t len, bool reliabl
         Peer& after = peer(dst);
         if (_wait.ack) {
             LOGI("SEND seq=%u ACK from %u rtt=%lums fb=0x%X attempts=%u", f.seq, dst, (unsigned long)waited, _wait.fb, a + 1);
-            if (adaptive()) stepLevel(after.level, after.streak, _wait.fb);
+            if (adaptive()) stepLevel(after.level, after.streak, _wait.fb, "tx", dst);
             return Result::OK;
         }
         if (_wait.nack) {
@@ -254,7 +255,8 @@ Result Node::send(uint8_t dst, const uint8_t* payload, uint8_t len, bool reliabl
         _st.timeouts++;
         LOGW("SEND seq=%u TIMEOUT after %lums (timeouts=%lu)", f.seq, (unsigned long)waited, (unsigned long)_st.timeouts);
         if (adaptive()) {                                                                // "0x0": max protection
-            LOGI("LVL TIMEOUT peer=%u lvl %u->%u", dst, after.level, (unsigned)MAX_LEVEL);
+            if (after.level != MAX_LEVEL) LOGI("LVL TIMEOUT peer=%u lvl %u->%u", dst, after.level, (unsigned)MAX_LEVEL);
+            else                          LOGD("LVL TIMEOUT peer=%u lvl=%u (already max)", dst, after.level);
             after.streak = 0; after.level = MAX_LEVEL;
         }
     }
@@ -286,21 +288,30 @@ void Node::handleAir(const uint8_t* buf, uint8_t n, const CC1101::RxInfo& ri) {
         case DecodeStatus::ECC_FAIL: {
             _st.rxEccFail++;
             uint8_t fb = feedback(_lhs.score(0, di.t, ri.rssiDbm, ri.lqi, true), ri.rssiDbm);
-            LOGW("RX ECC_FAIL len=%u t=%u rssi=%d lqi=%u fb=0x%X (total=%lu)", n, (unsigned)di.t, ri.rssiDbm, (unsigned)ri.lqi, fb, (unsigned long)_st.rxEccFail);
-            if (adaptive()) sendNack(fb);
+            LOGW("RX ECC_FAIL len=%u lvl=%u t=%u rssi=%d lqi=%u fb=0x%X (total=%lu)", n, (unsigned)di.level, (unsigned)di.t, ri.rssiDbm, (unsigned)ri.lqi, fb, (unsigned long)_st.rxEccFail);
+            if (adaptive()) {
+                if (_wait.active) LOGD("NACK skipped: waiting for ACK seq=%u (corrupted frame is most likely it)", _wait.seq);
+                else              sendNack(fb);
+            }
             return;
         }
         case DecodeStatus::CRC_FAIL: {
             _st.rxCrcFail++;
             uint8_t fb = feedback(_lhs.score(0, di.t, ri.rssiDbm, ri.lqi, true), ri.rssiDbm);
-            LOGW("RX CRC_FAIL len=%u t=%u rssi=%d lqi=%u fb=0x%X (total=%lu)", n, (unsigned)di.t, ri.rssiDbm, (unsigned)ri.lqi, fb, (unsigned long)_st.rxCrcFail);
-            if (adaptive()) sendNack(fb);
+            LOGW("RX CRC_FAIL len=%u lvl=%u t=%u rssi=%d lqi=%u fb=0x%X (total=%lu)", n, (unsigned)di.level, (unsigned)di.t, ri.rssiDbm, (unsigned)ri.lqi, fb, (unsigned long)_st.rxCrcFail);
+            if (adaptive()) {
+                if (_wait.active) LOGD("NACK skipped: waiting for ACK seq=%u (corrupted frame is most likely it)", _wait.seq);
+                else              sendNack(fb);
+            }
             return;
         }
     }
     _st.rxOk++; _st.eccCorrected += di.corrected;
     uint8_t fb = feedback(_lhs.score(di.corrected, di.t, ri.rssiDbm, ri.lqi, false), ri.rssiDbm);
-    LOGD("RX %s %u>%u seq=%u ttl=%u plen=%u corr=%u t=%u rssi=%d lqi=%u fb=0x%X", typeStr(f.type), f.src, f.dst, f.seq, f.ttl, f.plen, (unsigned)di.corrected, (unsigned)di.t, ri.rssiDbm, (unsigned)ri.lqi, fb);
+    if (f.type == MsgType::ACK && f.plen)
+        LOGD("RX ACK %u>%u ackFor=%u ttl=%u corr=%u lvl=%u t=%u rssi=%d lqi=%u fb=0x%X", f.src, f.dst, f.payload[0], f.ttl, (unsigned)di.corrected, (unsigned)di.level, (unsigned)di.t, ri.rssiDbm, (unsigned)ri.lqi, fb);
+    else
+        LOGD("RX %s %u>%u seq=%u ttl=%u plen=%u corr=%u lvl=%u t=%u rssi=%d lqi=%u fb=0x%X", typeStr(f.type), f.src, f.dst, f.seq, f.ttl, f.plen, (unsigned)di.corrected, (unsigned)di.level, (unsigned)di.t, ri.rssiDbm, (unsigned)ri.lqi, fb);
 
     if (f.type == MsgType::NACK) {                                            // link-local, never relayed
         if (_wait.active) {
@@ -312,8 +323,12 @@ void Node::handleAir(const uint8_t* buf, uint8_t n, const CC1101::RxInfo& ri) {
         return;
     }
     if (f.src == _cfg.id) { LOGD("RX own frame seq=%u ignored", f.seq); return; }
-    peer(f.src).rxFb = fb;
-    if (adaptive()) stepLevel(_hopLevel, _hopStreak, fb);
+    Peer& from = peer(f.src);
+    from.rxFb = fb;
+    if (adaptive()) {
+        stepLevel(_hopLevel, _hopStreak, fb, "hop", 0);                           // relay level
+        stepLevel(from.ackLevel, from.ackStreak, fb, "ack", f.src);               // level of our replies to f.src
+    }
     bool dup = seenOrAdd(f.src, f.seq);
     bool forMe = (f.dst == _cfg.id), bcast = (f.dst == BROADCAST);
     if (dup) LOGD("RX dup %u seq=%u", f.src, f.seq);
@@ -342,8 +357,9 @@ void Node::sendAck(const Frame& rx, uint8_t fb) {
     a.src = _cfg.id; a.dst = rx.src; a.seq = _seq++; a.ttl = _cfg.defaultTtl;
     a.type = MsgType::ACK; a.lhs = fb; a.plen = 1; a.payload[0] = rx.seq;
     seenOrAdd(a.src, a.seq);
-    Result r = transmit(a, levelFor(peer(rx.src)));
-    if (r == Result::OK) { _st.acksTx++; LOGD("ACK sent to %u for seq=%u fb=0x%X", rx.src, rx.seq, fb); }
+    Peer& to = peer(rx.src);
+    Result r = transmit(a, adaptive() ? to.ackLevel : LEVEL_NONE);                // was: to.level (never stepped on a pure receiver)
+    if (r == Result::OK) { _st.acksTx++; LOGD("ACK sent to %u for seq=%u fb=0x%X lvl=%u", rx.src, rx.seq, fb, adaptive() ? to.ackLevel : (unsigned)LEVEL_NONE); }
     else                 { LOGW("ACK to %u for seq=%u failed: %s", rx.src, rx.seq, resultStr(r)); }
 }
 
