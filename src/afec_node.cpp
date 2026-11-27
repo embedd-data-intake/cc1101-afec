@@ -83,12 +83,13 @@ bool Node::begin(CC1101& radio, const NodeConfig& cfg, const Platform& plat) {
     if (!plat.millis || !plat.random) return false;
     _r = &radio; _cfg = cfg; _p = plat;
     if (_cfg.initialLevel > MAX_LEVEL) _cfg.initialLevel = MAX_LEVEL;
+    if (pinned()) _cfg.initialLevel = _cfg.pinLevel;
     eccInit();
     _lhs.begin(_cfg.lhs);
     _hopLevel = _cfg.initialLevel;
     _budgetUs = (int64_t)_cfg.dutyBurstMs * 1000;
     _lastRefill = _p.millis();
-    LOGI("begin", "BEGIN mode=%u initLvl=%u bitrate=%lu duty=%u%% burst=%ums retries=%u ackTo=%ums", ",\"mode\":%u,\"init_lvl\":%u,\"bitrate\":%lu,\"duty_pct\":%u,\"burst_ms\":%u,\"retries\":%u,\"ack_to_ms\":%u", (unsigned)_cfg.mode, _cfg.initialLevel, (unsigned long)_cfg.bitrateBps, (unsigned)_cfg.dutyPercent, (unsigned)_cfg.dutyBurstMs, _cfg.maxRetries, (unsigned)_cfg.ackTimeoutMs);
+    LOGI("begin", "BEGIN mode=%u initLvl=%u bitrate=%lu duty=%u%% burst=%ums retries=%u ackTo=%ums pin=%u", ",\"mode\":%u,\"init_lvl\":%u,\"bitrate\":%lu,\"duty_pct\":%u,\"burst_ms\":%u,\"retries\":%u,\"ack_to_ms\":%u,\"pin\":%u", (unsigned)_cfg.mode, _cfg.initialLevel, (unsigned long)_cfg.bitrateBps, (unsigned)_cfg.dutyPercent, (unsigned)_cfg.dutyBurstMs, _cfg.maxRetries, (unsigned)_cfg.ackTimeoutMs, (unsigned)_cfg.pinLevel);
     return true;
 }
 
@@ -138,7 +139,9 @@ void Node::stepLevel(uint8_t& level, uint8_t& streak, uint8_t fb, const char* ta
     const uint8_t prevLevel = level, prevStreak = streak;
     const char* act = "-";
 
-    if (_cfg.mode == Mode::AFEC) {
+    if (pinned()) {
+        level = _cfg.pinLevel; streak = 0; act = "PINNED";
+    } else if (_cfg.mode == Mode::AFEC) {
         const Action a = Lhs::decide(fb);
         act = actionStr(a);
         switch (a) {
@@ -163,6 +166,7 @@ void Node::stepLevel(uint8_t& level, uint8_t& streak, uint8_t fb, const char* ta
 }
 
 void Node::nackJump(uint8_t& level) {
+    if (pinned()) { level = _cfg.pinLevel; return; }
     level = (level + _cfg.nackStep > MAX_LEVEL) ? MAX_LEVEL : level + _cfg.nackStep;
 }
 
@@ -275,9 +279,10 @@ Result Node::send(uint8_t dst, const uint8_t* payload, uint8_t len, bool reliabl
         _st.timeouts++;
         LOGW("send_timeout", "SEND seq=%u TIMEOUT after %lums (timeouts=%lu)", ",\"seq\":%u,\"waited_ms\":%lu,\"timeouts\":%lu", f.seq, (unsigned long)waited, (unsigned long)_st.timeouts);
         if (adaptive()) {                                                                // "0x0": max protection
-            LOGL(after.level != MAX_LEVEL ? 3 : 4, "lvl_timeout", "LVL TIMEOUT peer=%u lvl %u->%u",
-                 ",\"peer\":%u,\"from\":%u,\"to\":%u", dst, after.level, (unsigned)MAX_LEVEL);
-            after.streak = 0; after.level = MAX_LEVEL;
+            const uint8_t to = pinned() ? _cfg.pinLevel : MAX_LEVEL;
+            LOGL(after.level != to ? 3 : 4, "lvl_timeout", "LVL TIMEOUT peer=%u lvl %u->%u",
+                 ",\"peer\":%u,\"from\":%u,\"to\":%u", dst, after.level, (unsigned)to);
+            after.streak = 0; after.level = to;
         }
     }
     LOGE("send_fail", "SEND seq=%u dst=%u NO_ACK after %u tries", ",\"seq\":%u,\"dst\":%u,\"tries\":%u", f.seq, dst, tries);

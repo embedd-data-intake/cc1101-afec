@@ -34,6 +34,8 @@ struct RssiPolicy {
     uint8_t hys = 1;
 };
 
+constexpr uint8_t PIN_NONE = 0xFF;   // NodeConfig::pinLevel: adapt as usual
+
 struct NodeConfig {
     uint8_t  id            = 1;          // 0x01..0xFE (0xFF = broadcast)
     Mode     mode          = Mode::AFEC;
@@ -47,6 +49,8 @@ struct NodeConfig {
     uint8_t  maxRetries    = 3;          // R_max, same for C2..C5
     uint8_t  downgradeAfter= 2;          // C5: consecutive 0xF before stepping down (paper: 1)
     uint8_t  nackStep      = 2;          // C4/C5: levels to jump on NACK
+    uint8_t  pinLevel      = PIN_NONE;   // C4/C5: 0..MAX_LEVEL fixes the level (P3 pinned-level sweep);
+                                         // ACK feedback, NACKs and timeouts then leave it unchanged
     uint16_t relayJitterMinMs = 10, relayJitterMaxMs = 120;
     uint16_t nackHoldoffMs = 150;
     LhsParams  lhs;
@@ -96,6 +100,7 @@ private:
     static constexpr uint8_t NPEERS = 8, NSEEN = 32, NRELAY = 2;
 
     bool    adaptive() const { return _cfg.mode == Mode::RSSI || _cfg.mode == Mode::AFEC; }
+    bool    pinned() const   { return _cfg.pinLevel <= MAX_LEVEL; }
     uint8_t levelFor(const Peer& p) const;
     uint8_t rssiQ(int16_t rssi) const;
     uint8_t feedback(uint8_t score, int16_t rssi) const;

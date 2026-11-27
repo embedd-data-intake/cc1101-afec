@@ -217,6 +217,7 @@ Driver behaviour:
 | `ackTimeoutMs` / `maxRetries` | 400 / 3 | C2–C5 |
 | `downgradeAfter` | 2 | C5 |
 | `nackStep` | 2 | C4/C5 |
+| `pinLevel` | `PIN_NONE` (adapt) | C4/C5; P3 sweep only |
 | `relayJitterMinMs` / `relayJitterMaxMs` | 10 / 120 | relay |
 | `nackHoldoffMs` | 150 | NACK |
 | `lhs` | −110 / −50 dBm, `lqiWorst` 80 | LHS quantisers |
@@ -226,7 +227,7 @@ Driver behaviour:
 
 These are facts about the code, not bug reports. The code is frozen for the measurement campaign.
 
-- **No way to pin a level.** C4/C5 always adapt, and NACKs and timeouts move the level in any adaptive mode. A fixed-level sweep would need a flag (see `docs/07-run-plan.md` in the main repo, decision 1).
+- **Pinned level (P3 only, since 2026-11-27).** `pinLevel` (default `PIN_NONE` = 0xFF) fixes the level of a C4/C5 node at 0..5: `begin()` starts at it, and the ACK step (`lvl_step` action `PINNED`), the NACK jump and the timeout all leave it there. The feedback (LHS or rssiQ) is still computed, sent and logged. It exists for the pinned-level characterisation sweep (main repo PLAN D1); campaign configurations C1–C5 never set it.
 - **Timeout → level 5 immediately.** One lost ACK in C4/C5 sends the next retry to RS t=8. Under bursty loss this dominates the level trajectory.
 - **Shared seq counter.** ACKs and NACKs consume `_seq` too, so a receiver's own seq values are not contiguous. The sender's DATA seq values are contiguous only while it sends no ACKs or NACKs. A sender in C4/C5 sends a NACK if it receives a corrupted frame while it is not waiting for an ACK, for example a late ACK. Key packets on the `send` event, not on seq arithmetic.
 - **`fitLevel` clamp is silent at INFO.** A payload over 36 B can never use RS t=8. The `lvl_step` event still reports level 5, but `tx.lvl` shows what actually went on air.

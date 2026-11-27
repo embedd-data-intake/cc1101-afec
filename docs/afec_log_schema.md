@@ -46,7 +46,7 @@ Fields used in several events:
 
 | ev | lv | Fields | When |
 | --- | --- | --- | --- |
-| `begin` | I | `mode` (0 = RAW/C1, 1 = ARQ/C2, 2 = HWFEC/C3, 3 = RSSI/C4, 4 = AFEC/C5), `init_lvl`, `bitrate`, `duty_pct`, `burst_ms`, `retries`, `ack_to_ms` | `Node::begin()`. Every call resets the config, the LHS LUT and the duty budget. |
+| `begin` | I | `mode` (0 = RAW/C1, 1 = ARQ/C2, 2 = HWFEC/C3, 3 = RSSI/C4, 4 = AFEC/C5), `init_lvl`, `bitrate`, `duty_pct`, `burst_ms`, `retries`, `ack_to_ms`, `pin` (255 = not pinned, else the pinned level) | `Node::begin()`. Every call resets the config, the LHS LUT and the duty budget. |
 | `link_reset` | I | `peer`, `lvl` | `resetLink()`. The peer's TX and ACK levels and the hop level go back to `initialLevel`. |
 | `peer_new` | D | `id`, `lvl` | A peer-table slot is allocated. |
 | `peer_evict` | D | `id` | The least recently used peer is evicted. There are 8 slots. |
@@ -87,6 +87,7 @@ The `action` field:
 
 - C5: `DOWNGRADE`, `HOLD`, `UPGRADE`, `NACK_UPGRADE` or `MAX_PROTECT` (Table 1).
 - C4: `RSSI_UP`, `RSSI_DOWN` or `RSSI_HOLD`.
+- Pinned (`pin` ≠ 255, P3 sweep): `PINNED`. `lvl_timeout` and `lvl_nack_jump` then report `to` = the pinned level.
 
 ### TX (any frame)
 
